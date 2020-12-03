@@ -19,6 +19,7 @@ package controllers
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"reflect"
 
 	utilyaml "github.com/ghodss/yaml"
@@ -28,13 +29,13 @@ import (
 	"k8s.io/klog"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/event"
-	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	apiv3 "github.com/IBM/ibm-common-service-operator/api/v3"
 	"github.com/IBM/ibm-common-service-operator/controllers/bootstrap"
 	util "github.com/IBM/ibm-common-service-operator/controllers/common"
+	"github.com/IBM/ibm-common-service-operator/controllers/constant"
 	"github.com/IBM/ibm-common-service-operator/controllers/deploy"
+	"github.com/IBM/ibm-common-service-operator/controllers/rules"
 	"github.com/IBM/ibm-common-service-operator/controllers/size"
 )
 
@@ -61,7 +62,7 @@ func (r *CommonServiceReconciler) Reconcile(req ctrl.Request) (ctrl.Result, erro
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	// Init common servcie bootstrap resource
+	// Init common service bootstrap resource
 	if err := r.Bootstrap.InitResources(instance.Spec.ManualManagement); err != nil {
 		klog.Errorf("Failed to initialize resources: %v", err)
 		return ctrl.Result{}, err
@@ -118,21 +119,30 @@ func (r *CommonServiceReconciler) updateOpcon(newConfigs []interface{}) error {
 	opcon := util.NewUnstructured("operator.ibm.com", "OperandConfig", "v1alpha1")
 	opconKey := types.NamespacedName{
 		Name:      "common-service",
-		Namespace: "ibm-common-services",
+		Namespace: constant.MasterNamespace,
 	}
 	if err := r.Reader.Get(ctx, opconKey, opcon); err != nil {
 		klog.Errorf("failed to get OperandConfig %s: %v", opconKey.String(), err)
 		return err
 	}
 	services := opcon.Object["spec"].(map[string]interface{})["services"].([]interface{})
+	// Convert rules string to slice
+	rules, err := convertStringtoInterfaceSlice(rules.ConfigurationRules)
+	if err != nil {
+		return err
+	}
+
+	if err != nil {
+		klog.Errorf("failed to convert string to slice: %v", err)
+	}
 	for _, service := range services {
-		for _, size := range newConfigs {
+		for index, size := range newConfigs {
 			if service.(map[string]interface{})["name"].(string) == size.(map[string]interface{})["name"].(string) {
 				for cr, spec := range service.(map[string]interface{})["spec"].(map[string]interface{}) {
 					if size.(map[string]interface{})["spec"].(map[string]interface{})[cr] == nil {
 						continue
 					}
-					service.(map[string]interface{})["spec"].(map[string]interface{})[cr] = mergeConfig(spec.(map[string]interface{}), size.(map[string]interface{})["spec"].(map[string]interface{})[cr].(map[string]interface{}))
+					service.(map[string]interface{})["spec"].(map[string]interface{})[cr] = mergeConfigwithRule(spec.(map[string]interface{}), size.(map[string]interface{})["spec"].(map[string]interface{})[cr].(map[string]interface{}), rules[index].(map[string]interface{})["spec"].(map[string]interface{})[cr].(map[string]interface{}))
 				}
 			}
 		}
@@ -148,22 +158,31 @@ func (r *CommonServiceReconciler) updateOpcon(newConfigs []interface{}) error {
 	return nil
 }
 
-func deepMerge(src []interface{}, dest string) []interface{} {
+func convertStringtoInterfaceSlice(str string) ([]interface{}, error) {
 
-	jsonSpec, err := utilyaml.YAMLToJSON([]byte(dest))
-
+	jsonSpec, err := utilyaml.YAMLToJSON([]byte(str))
 	if err != nil {
-		klog.Errorf("failed to convert yaml to json: %v", err)
+		return nil, fmt.Errorf("failed to convert yaml to json: ", err)
 	}
 
-	// Create a slice for sizes
-	var sizes []interface{}
+	// Create a slice
+	var slice []interface{}
+	// Convert sizes string to slice
+	err = json.Unmarshal(jsonSpec, &slice)
+	if err != nil {
+		return nil, fmt.Errorf("failed to convert string to slice: ", err)
+	}
+
+	return slice, nil
+}
+
+func deepMerge(src []interface{}, dest string) []interface{} {
 
 	// Convert sizes string to slice
-	err = json.Unmarshal(jsonSpec, &sizes)
+	sizes, err := convertStringtoInterfaceSlice(dest)
 
 	if err != nil {
-		klog.Errorf("failed to convert string to slice: %v", err)
+		klog.Errorf("convert size to interface slice: ",err)
 	}
 
 	for _, configSize := range sizes {
@@ -193,6 +212,14 @@ func mergeConfig(defaultMap map[string]interface{}, changedMap map[string]interf
 	return changedMap
 }
 
+// mergeConfigwithRule deep merge two configs by specific rules
+func mergeConfigwithRule(defaultMap map[string]interface{}, changedMap map[string]interface{}, rules map[string]interface{}) map[string]interface{} {
+	for key := range defaultMap {
+		checkKeyBeforeMergingwithRules(key, defaultMap[key], changedMap[key], rules[key], changedMap)
+	}
+	return changedMap
+}
+
 func checkKeyBeforeMerging(key string, defaultMap interface{}, changedMap interface{}, finalMap map[string]interface{}) {
 	if !reflect.DeepEqual(defaultMap, changedMap) {
 		switch defaultMap := defaultMap.(type) {
@@ -216,44 +243,31 @@ func checkKeyBeforeMerging(key string, defaultMap interface{}, changedMap interf
 	}
 }
 
-// Check if the request's NamespacedName is equal "ibm-common-services/common-service"
-func checkNamespace(key string) bool {
-	if key != "ibm-common-services/common-service" {
-		klog.Infof("Ignore reconcile when commonservices.operator.ibm.com is NamespacedName '%s', only reconcile for NamespacedName 'ibm-common-services/common-service'", key)
-		return false
-	}
-	return true
-}
-
-func filterNamespacePredicate() predicate.Predicate {
-	return predicate.Funcs{
-		CreateFunc: func(e event.CreateEvent) bool {
-			// Only reconcle when NamespacedName equal "ibm-common-services/common-service"
-			key := e.Meta.GetNamespace() + "/" + e.Meta.GetName()
-			return checkNamespace(key)
-		},
-		UpdateFunc: func(e event.UpdateEvent) bool {
-			// Only reconcle when NamespacedName equal "ibm-common-services/common-service"
-			key := e.MetaNew.GetNamespace() + "/" + e.MetaNew.GetName()
-			return checkNamespace(key)
-		},
-		DeleteFunc: func(e event.DeleteEvent) bool {
-			// Evaluates to false if the object has been confirmed deleted.
-			// Only reconcle when NamespacedName equal "ibm-common-services/common-service"
-			key := e.Meta.GetNamespace() + "/" + e.Meta.GetName()
-			return !e.DeleteStateUnknown && checkNamespace(key)
-		},
-		GenericFunc: func(e event.GenericEvent) bool {
-			// Only reconcle when NamespacedName equal "ibm-common-services/common-service"
-			key := e.Meta.GetNamespace() + "/" + e.Meta.GetName()
-			return checkNamespace(key)
-		},
+func checkKeyBeforeMergingwithRules(key string, defaultMap interface{}, changedMap interface{}, rules interface{},finalMap map[string]interface{}) {
+	if !reflect.DeepEqual(defaultMap, changedMap) {
+		switch defaultMap := defaultMap.(type) {
+		case map[string]interface{}:
+			//Check that the changed map value doesn't contain this map at all and is nil
+			if changedMap == nil {
+				finalMap[key] = defaultMap
+			} else if _, ok := changedMap.(map[string]interface{}); ok { //Check that the changed map value is also a map[string]interface
+				defaultMapRef := defaultMap
+				changedMapRef := changedMap.(map[string]interface{})
+				for newKey := range defaultMapRef {
+					checkKeyBeforeMerging(newKey, defaultMapRef[newKey], changedMapRef[newKey], finalMap[key].(map[string]interface{}))
+				}
+			}
+		default:
+			//Check if the value was set, otherwise set it
+			if changedMap == nil {
+				finalMap[key] = defaultMap
+			}
+		}
 	}
 }
 
 func (r *CommonServiceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&apiv3.CommonService{}).
-		WithEventFilter(filterNamespacePredicate()).
 		Complete(r)
 }
